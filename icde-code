@@ -1,0 +1,204 @@
+import torch  
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset, Subset
+from efficientnet_pytorch import EfficientNet
+import torch.nn.functional as F
+import numpy as np
+import cv2
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class CombinedDataset(Dataset):
+    def __init__(self, mnist_dataset, cifar10_dataset):
+        self.mnist_dataset = mnist_dataset
+        self.cifar10_dataset = cifar10_dataset
+
+    def __len__(self):
+        return len(self.mnist_dataset) + len(self.cifar10_dataset)
+
+    def __getitem__(self, idx):
+        if idx < len(self.mnist_dataset):
+            image, label = self.mnist_dataset[idx]
+            return image, label
+        else:
+            idx_cifar = idx - len(self.mnist_dataset)
+            image, label = self.cifar10_dataset[idx_cifar]
+            label += 10
+            return image, label
+
+def get_dataloader(batch_size=64, subset_size=5000):
+    transform_mnist = transforms.Compose([
+        transforms.Resize(224),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    transform_cifar = transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    mnist_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform_mnist)
+    cifar10_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_cifar)
+    
+    mnist_subset = Subset(mnist_dataset, range(subset_size))
+    cifar10_subset = Subset(cifar10_dataset, range(subset_size))
+
+    combined_train_dataset = CombinedDataset(mnist_subset, cifar10_subset)
+    
+    train_loader = DataLoader(combined_train_dataset, batch_size=batch_size, shuffle=True)
+
+    test_mnist_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform_mnist)
+    test_cifar10_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_cifar)
+    
+    test_mnist_subset = Subset(test_mnist_dataset, range(subset_size))
+    test_cifar10_subset = Subset(test_cifar10_dataset, range(subset_size))
+
+    combined_test_dataset = CombinedDataset(test_mnist_subset, test_cifar10_subset)
+    test_loader = DataLoader(combined_test_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, test_loader
+
+class PerturbationGenerator(nn.Module):
+    def __init__(self, epsilon=0.05):
+        super(PerturbationGenerator, self).__init__()
+        self.epsilon = epsilon
+        self.layer1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.layer2 = nn.Conv2d(32, 1, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x, edges):
+        x = F.relu(self.layer1(edges))
+        x = F.relu(self.layer2(x))
+        perturbation = x * self.epsilon
+        return perturbation
+
+def canny_edge_detection(inputs):
+    batch_size, channels, height, width = inputs.shape
+    edges_list = []
+    for i in range(batch_size):
+        image = inputs[i].cpu().numpy().transpose(1, 2, 0)
+        image_gray = np.mean(image, axis=-1)
+        edges = cv2.Canny(image_gray.astype(np.uint8), 100, 200)
+        edges_tensor = torch.tensor(edges, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        edges_list.append(edges_tensor)
+    edges_batch = torch.cat(edges_list, dim=0).to(inputs.device)
+    return edges_batch
+
+class EfficientNetForMultiDataset(nn.Module):
+    def __init__(self, num_classes=20):
+        super(EfficientNetForMultiDataset, self).__init__()
+        self.model = EfficientNet.from_name('efficientnet-b0')
+        self.model._fc = nn.Linear(self.model._fc.in_features, num_classes)
+
+    def forward(self, x):
+        return self.model(x)
+
+def contrastive_loss(outputs_clean, outputs_perturbed1, outputs_perturbed2, temperature):
+    outputs_clean = F.normalize(outputs_clean, p=2, dim=1)
+    outputs_perturbed1 = F.normalize(outputs_perturbed1, p=2, dim=1)
+    outputs_perturbed2 = F.normalize(outputs_perturbed2, p=2, dim=1)
+    positive_similarity = torch.mm(outputs_clean, outputs_clean.T) / 0.2
+    negative_similarity1 = torch.mm(outputs_clean, outputs_perturbed1.T) / temperature
+    negative_similarity2 = torch.mm(outputs_clean, outputs_perturbed2.T) / temperature
+    mask = torch.eye(positive_similarity.size(0), device=positive_similarity.device).bool()
+    positive_similarity = positive_similarity.masked_fill(mask, -float('inf'))
+    positive_exp = torch.exp(positive_similarity)
+    negative_exp1 = torch.exp(negative_similarity1)
+    negative_exp2 = torch.exp(negative_similarity2)
+    denominator = positive_exp.sum(dim=1) + negative_exp1.sum(dim=1) + negative_exp2.sum(dim=1)
+    contrastive_loss_value = -torch.log(positive_exp.sum(dim=1) / denominator)
+    return contrastive_loss_value.mean()
+
+def classification_loss(outputs, labels):
+    return F.cross_entropy(outputs, labels)
+
+def cosine_similarity_loss(original, perturbed):
+    cos_sim = F.cosine_similarity(original.view(original.size(0), -1), perturbed.view(perturbed.size(0), -1))
+    return 1 - cos_sim.mean()
+
+max_loss_value = 10.0
+
+def incorrect_classification_loss(outputs_clean, labels, loss1):
+    loss2 = -F.cross_entropy(outputs_clean, labels)
+    loss2 = torch.clamp(loss2, min=-max_loss_value, max=max_loss_value)
+    return loss2
+
+def train_with_perturbations(model, perturbation_generator1, perturbation_generator2, train_loader, optimizer, device, epochs):
+    for epoch in range(epochs):
+        model.train()
+        perturbation_generator1.train()
+        perturbation_generator2.train()
+        running_loss = 0.0
+        for batch_idx, (inputs, labels) in enumerate(train_loader):
+            inputs, labels = inputs.to(device), labels.to(device)
+            edges = canny_edge_detection(inputs)
+            perturbation1 = perturbation_generator1(inputs, edges)
+            perturbed_inputs1 = inputs + perturbation1
+            perturbation2 = perturbation_generator2(inputs, edges)
+            perturbed_inputs2 = inputs + perturbation2
+            outputs_clean = model(inputs)
+            outputs_perturbed1 = model(perturbed_inputs1)
+            outputs_perturbed2 = model(perturbed_inputs2)
+            loss1 = classification_loss(outputs_perturbed1, labels)
+            loss2 = incorrect_classification_loss(outputs_clean, labels, loss1)
+            loss3 = cosine_similarity_loss(inputs, perturbed_inputs1)
+            loss4 = F.binary_cross_entropy_with_logits(outputs_perturbed2[:, :1], (labels < 10).float().unsqueeze(1))
+            loss5 = cosine_similarity_loss(inputs, perturbed_inputs2)
+            contrastive_loss_value = contrastive_loss(outputs_clean, outputs_perturbed1, outputs_perturbed2, temperature=0.5)
+            total_loss = 3 * loss1 + loss2 + 5 * loss3 + 2 * loss4 + 2 * loss5 + contrastive_loss_value
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            running_loss += total_loss.item()
+            if batch_idx % 100 == 99:
+                print(f'Epoch [{epoch+1}/{epochs}], Batch [{batch_idx+1}], Loss: {running_loss / 100:.4f}')
+                running_loss = 0.0
+        print(f'\nEpoch {epoch+1}/{epochs} completed. Evaluating on test set...\n')
+        test(model, test_loader, perturbation_generator1, perturbation_generator2, device)
+        print('-' * 80)
+
+def test(model, test_loader, perturbation_generator1, perturbation_generator2, device):
+    model.eval()
+    correct_clean = 0
+    correct_perturbed1 = 0
+    correct_perturbed2 = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            edges = canny_edge_detection(inputs)
+            perturbation1 = perturbation_generator1(inputs, edges)
+            perturbed_inputs1 = inputs + perturbation1
+            perturbation2 = perturbation_generator2(inputs, edges)
+            perturbed_inputs2 = inputs + perturbation2
+            outputs_clean = model(inputs)
+            outputs_perturbed1 = model(perturbed_inputs1)
+            outputs_perturbed2 = model(perturbed_inputs2)
+            _, predicted_clean = torch.max(outputs_clean, 1)
+            _, predicted_perturbed1 = torch.max(outputs_perturbed1, 1)
+            _, predicted_perturbed2 = torch.max(outputs_perturbed2, 1)
+            total += labels.size(0)
+            correct_clean += (predicted_clean == labels).sum().item()
+            correct_perturbed1 += (predicted_perturbed1 == labels).sum().item()
+            correct_perturbed2 += ((predicted_perturbed2 < 10) == (labels < 10)).sum().item()
+
+    accuracy_clean = 100 * correct_clean / total
+    accuracy_perturbed1 = 100 * correct_perturbed1 / total
+    accuracy_perturbed2 = 100 * correct_perturbed2 / total
+
+    print(f"Accuracy on clean test set: {accuracy_clean:.2f}%")
+    print(f"Accuracy on perturbed1 test set: {accuracy_perturbed1:.2f}%")
+    print(f"Accuracy on perturbed2 test set: {accuracy_perturbed2:.2f}%")
+
+train_loader, test_loader = get_dataloader(batch_size=64, subset_size=5000)
+model = EfficientNetForMultiDataset(num_classes=20).to(device)
+perturbation_generator1 = PerturbationGenerator().to(device)
+perturbation_generator2 = PerturbationGenerator().to(device)
+optimizer = optim.Adam(list(model.parameters()) + list(perturbation_generator1.parameters()) + list(perturbation_generator2.parameters()), lr=0.001)
+train_with_perturbations(model, perturbation_generator1, perturbation_generator2, train_loader, optimizer, device, epochs=30)
